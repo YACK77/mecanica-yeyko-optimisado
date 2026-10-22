@@ -1,0 +1,474 @@
+from fastapi import FastAPI, Depends, HTTPException, status, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from sqlalchemy.orm import Session
+from typing import List
+import os
+
+import models
+import schemas
+import slack_service
+from database import engine, get_db
+
+
+# Crear tablas automáticamente en la base de datos (Supabase) si no existen
+try:
+    models.Base.metadata.create_all(bind=engine)
+except Exception as e:
+    print(f"Advertencia al verificar tablas: {e}")
+
+app = FastAPI(
+    title="API Mecánica Yeyko - Gestión, Ventas e Inventario",
+    description="Backend oficial para el sistema de control operativo de 'Mecánica Yeyko'. Desarrollado con FastAPI y Supabase PostgreSQL.",
+    version="1.0.0"
+)
+
+# Habilitar CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Middleware para Vercel Serverless: restaurar la ruta original solicitada
+@app.middleware("http")
+async def vercel_path_middleware(request: Request, call_next):
+    original_uri = request.headers.get("x-forwarded-uri") or request.headers.get("x-matched-path")
+    if original_uri:
+        request.scope["path"] = original_uri.split("?")[0]
+    elif request.scope.get("path") in ["/api/index.py", "/api/index", "/api"]:
+        request.scope["path"] = "/"
+    return await call_next(request)
+
+# Configuración de rutas de archivos estáticos
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STATIC_DIR = os.path.join(BASE_DIR, "static")
+
+if os.path.exists(STATIC_DIR):
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+@app.get("/", tags=["Interfaz Web"])
+@app.get("/api/index.py", include_in_schema=False)
+@app.get("/api/index", include_in_schema=False)
+def read_root():
+    """Servir la interfaz web visual amigable de Mecánica Yeyko."""
+    posibles_rutas = [
+        os.path.join(BASE_DIR, "static", "index.html"),
+        os.path.join(BASE_DIR, "index.html"),
+        os.path.join(BASE_DIR, "api", "index.html"),
+        "static/index.html",
+        "index.html"
+    ]
+    for ruta in posibles_rutas:
+        if os.path.exists(ruta):
+            with open(ruta, "r", encoding="utf-8") as f:
+                from fastapi.responses import HTMLResponse
+                return HTMLResponse(content=f.read())
+
+    return {
+        "sistema": "Mecánica Yeyko - Sistema de Gestión y Control Operativo",
+        "estado": "En línea",
+        "documentacion_swagger": "/docs"
+    }
+
+
+
+
+
+# ==========================================================
+# 1. CATÁLOGO E INVENTARIO DE REPUESTOS (products)
+# ==========================================================
+@app.get("/api/v1/products", response_model=List[schemas.ProductOut], tags=["Inventario"])
+def list_products(db: Session = Depends(get_db)):
+    """Obtener catálogo completo de repuestos y servicios del taller."""
+    return db.query(models.Product).filter(models.Product.activo == True).all()
+
+
+@app.post("/api/v1/products", response_model=schemas.ProductOut, status_code=status.HTTP_201_CREATED, tags=["Inventario"])
+def create_product(product: schemas.ProductCreate, db: Session = Depends(get_db)):
+    """Registrar un nuevo repuesto o servicio automotriz en el catálogo."""
+    db_product = db.query(models.Product).filter(models.Product.sku == product.sku).first()
+    if db_product:
+        raise HTTPException(
+            status_code=400,
+            detail=f"El código SKU '{product.sku}' ya está registrado en el inventario."
+        )
+
+    new_product = models.Product(**product.model_dump())
+    db.add(new_product)
+    db.commit()
+    db.refresh(new_product)
+
+    # Si se crea con stock inicial mayor a 0, registrar en Kardex
+    if new_product.stock_actual > 0:
+        mov = models.InventoryMovement(
+            product_id=new_product.id,
+            tipo_movimiento="ENTRADA",
+            cantidad=new_product.stock_actual,
+            stock_anterior=0,
+            stock_posterior=new_product.stock_actual,
+            referencia_origen="INVENTARIO_INICIAL",
+            motivo="Carga inicial de producto al catálogo"
+        )
+        db.add(mov)
+        db.commit()
+
+    return new_product
+
+
+@app.get("/api/v1/products/{product_id}", response_model=schemas.ProductOut, tags=["Inventario"])
+def get_product(product_id: int, db: Session = Depends(get_db)):
+    """Consultar un repuesto específico por su ID."""
+    product = db.query(models.Product).filter(models.Product.id == product_id).first()
+    if not product:
+        raise HTTPException(status_code=404, detail="Repuesto no encontrado")
+    return product
+
+
+# ==========================================================
+# 2. PROVEEDORES Y COMPRAS (purchases & purchase_items)
+# ==========================================================
+@app.post("/api/v1/purchases", response_model=schemas.PurchaseOut, status_code=status.HTTP_201_CREATED, tags=["Compras"])
+def register_purchase(purchase_in: schemas.PurchaseCreate, db: Session = Depends(get_db)):
+    """
+    Registrar ingreso de mercancía de proveedores.
+    Suma stock a los repuestos y crea el movimiento en Kardex.
+    """
+    if not purchase_in.items:
+        raise HTTPException(status_code=400, detail="La compra debe incluir al menos un repuesto.")
+
+    total_calculado = 0.0
+    items_to_create = []
+    movements_to_create = []
+
+    try:
+        for item in purchase_in.items:
+            product = db.query(models.Product).filter(models.Product.id == item.product_id).first()
+            if not product:
+                raise HTTPException(status_code=404, detail=f"Repuesto con ID {item.product_id} no existe")
+
+            subtotal = item.cantidad * item.costo_unitario
+            total_calculado += subtotal
+
+            stock_anterior = product.stock_actual
+            product.stock_actual += item.cantidad
+            product.precio_compra = item.costo_unitario  # Actualiza último costo
+            stock_posterior = product.stock_actual
+
+            items_to_create.append({
+                "product_id": product.id,
+                "cantidad": item.cantidad,
+                "costo_unitario": item.costo_unitario,
+                "subtotal": subtotal
+            })
+
+            movements_to_create.append({
+                "product_id": product.id,
+                "tipo_movimiento": "ENTRADA",
+                "cantidad": item.cantidad,
+                "stock_anterior": stock_anterior,
+                "stock_posterior": stock_posterior
+            })
+
+        # Cabecera de compra
+        db_purchase = models.Purchase(
+            proveedor_nombre=purchase_in.proveedor_nombre,
+            proveedor_nit=purchase_in.proveedor_nit,
+            numero_factura=purchase_in.numero_factura,
+            total_compra=total_calculado,
+            usuario_id=purchase_in.usuario_id
+        )
+        db.add(db_purchase)
+        db.flush()
+
+        # Detalle de compra
+        for it in items_to_create:
+            db_item = models.PurchaseItem(
+                purchase_id=db_purchase.id,
+                product_id=it["product_id"],
+                cantidad=it["cantidad"],
+                costo_unitario=it["costo_unitario"],
+                subtotal=it["subtotal"]
+            )
+            db.add(db_item)
+
+        # Kardex
+        for mov in movements_to_create:
+            db_mov = models.InventoryMovement(
+                product_id=mov["product_id"],
+                tipo_movimiento=mov["tipo_movimiento"],
+                cantidad=mov["cantidad"],
+                stock_anterior=mov["stock_anterior"],
+                stock_posterior=mov["stock_posterior"],
+                referencia_origen=f"COMPRA #{db_purchase.id}",
+                motivo=f"Ingreso de proveedor: {purchase_in.proveedor_nombre}"
+            )
+            db.add(db_mov)
+
+        db.commit()
+        db.refresh(db_purchase)
+
+        # Disparar notificación automática a Slack
+        try:
+            slack_service.notify_purchase(
+                purchase_id=db_purchase.id,
+                proveedor=purchase_in.proveedor_nombre,
+                factura=purchase_in.numero_factura,
+                total=total_calculado,
+                items_count=len(items_to_create)
+            )
+        except Exception as slack_err:
+            print(f"Error secundario al notificar compra en Slack: {slack_err}")
+
+        return db_purchase
+
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Error al registrar compra: {str(e)}")
+
+
+@app.get("/api/v1/purchases", response_model=List[schemas.PurchaseOut], tags=["Compras"])
+def list_purchases(db: Session = Depends(get_db)):
+    """Listar historial de compras realizadas."""
+    return db.query(models.Purchase).order_by(models.Purchase.id.desc()).all()
+
+
+# ==========================================================
+# 3. CLIENTES Y VENTAS / SALIDAS (sales & sale_items)
+# ==========================================================
+@app.post("/api/v1/sales/checkout", response_model=schemas.SaleOut, status_code=status.HTTP_201_CREATED, tags=["Ventas"])
+def checkout_sale(sale_in: schemas.SaleCreate, db: Session = Depends(get_db)):
+    """
+    Registrar venta a cliente o repuestos usados en un vehículo.
+    Valida disponibilidad, descuenta existencias de forma atómica y genera Kardex.
+    """
+    if not sale_in.items:
+        raise HTTPException(status_code=400, detail="La venta debe incluir al menos un producto o servicio.")
+
+    total_calculado = 0.0
+    items_to_create = []
+    movements_to_create = []
+
+    try:
+        # Validación y descuento
+        for item in sale_in.items:
+            product = db.query(models.Product).filter(models.Product.id == item.product_id).first()
+            if not product:
+                raise HTTPException(status_code=404, detail=f"Repuesto ID {item.product_id} no encontrado")
+
+            # Si es un bien físico, verificar y descontar stock
+            if not product.es_servicio:
+                if product.stock_actual < item.cantidad:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Stock insuficiente para '{product.nombre}'. Solicitado: {item.cantidad}, Disponible: {product.stock_actual}"
+                    )
+                stock_anterior = product.stock_actual
+                product.stock_actual -= item.cantidad
+                stock_posterior = product.stock_actual
+
+                movements_to_create.append({
+                    "product_id": product.id,
+                    "tipo_movimiento": "SALIDA",
+                    "cantidad": item.cantidad,
+                    "stock_anterior": stock_anterior,
+                    "stock_posterior": stock_posterior
+                })
+
+            subtotal = product.precio_venta * item.cantidad
+            total_calculado += subtotal
+
+            items_to_create.append({
+                "product_id": product.id,
+                "cantidad": item.cantidad,
+                "precio_unitario": product.precio_venta,
+                "subtotal": subtotal
+            })
+
+        # Cabecera de venta
+        db_sale = models.Sale(
+            cliente_nombre=sale_in.cliente_nombre,
+            cliente_ci_nit=sale_in.cliente_ci_nit,
+            placa_vehiculo=sale_in.placa_vehiculo,
+            total_venta=total_calculado,
+            metodo_pago=sale_in.metodo_pago,
+            usuario_id=sale_in.usuario_id
+        )
+        db.add(db_sale)
+        db.flush()
+
+        # Detalle de venta
+        for it in items_to_create:
+            db_item = models.SaleItem(
+                sale_id=db_sale.id,
+                product_id=it["product_id"],
+                cantidad=it["cantidad"],
+                precio_unitario=it["precio_unitario"],
+                subtotal=it["subtotal"]
+            )
+            db.add(db_item)
+
+        # Kardex
+        for mov in movements_to_create:
+            db_mov = models.InventoryMovement(
+                product_id=mov["product_id"],
+                tipo_movimiento=mov["tipo_movimiento"],
+                cantidad=mov["cantidad"],
+                stock_anterior=mov["stock_anterior"],
+                stock_posterior=mov["stock_posterior"],
+                referencia_origen=f"VENTA #{db_sale.id}",
+                motivo=f"Venta a: {sale_in.cliente_nombre}" + (f" (Vehículo: {sale_in.placa_vehiculo})" if sale_in.placa_vehiculo else "")
+            )
+            db.add(db_mov)
+
+        db.commit()
+        db.refresh(db_sale)
+
+        # Disparar notificación automática de venta a Slack
+        try:
+            # Obtener nombres de productos para el detalle
+            detalle_items = []
+            for it in items_to_create:
+                prod = db.query(models.Product).filter(models.Product.id == it["product_id"]).first()
+                detalle_items.append({
+                    "nombre": prod.nombre if prod else f"Repuesto #{it['product_id']}",
+                    "cantidad": it["cantidad"],
+                    "subtotal": it["subtotal"]
+                })
+                # Verificar si el repuesto cayó por debajo del stock mínimo
+                if prod and not prod.es_servicio and prod.stock_actual <= prod.stock_minimo:
+                    slack_service.notify_low_stock(
+                        producto_nombre=prod.nombre,
+                        sku=prod.sku,
+                        stock_actual=prod.stock_actual,
+                        stock_minimo=prod.stock_minimo
+                    )
+
+            slack_service.notify_sale(
+                sale_id=db_sale.id,
+                cliente_nombre=sale_in.cliente_nombre,
+                placa=sale_in.placa_vehiculo or "",
+                total=total_calculado,
+                metodo_pago=sale_in.metodo_pago,
+                items=detalle_items
+            )
+        except Exception as slack_err:
+            print(f"Error secundario al notificar venta en Slack: {slack_err}")
+
+        return db_sale
+
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Error en la transacción de venta: {str(e)}")
+
+
+@app.get("/api/v1/sales", response_model=List[schemas.SaleOut], tags=["Ventas"])
+def list_sales(db: Session = Depends(get_db)):
+    """Consultar historial de ventas y cobros realizados."""
+    return db.query(models.Sale).order_by(models.Sale.id.desc()).all()
+
+
+# ==========================================================
+# 4. KARDEX Y MOVIMIENTOS DE INVENTARIO (inventory_movements)
+# ==========================================================
+@app.get("/api/v1/movements", response_model=List[schemas.InventoryMovementOut], tags=["Kardex"])
+def list_inventory_movements(db: Session = Depends(get_db)):
+    """Auditoría de todos los movimientos de inventario (Entradas, Salidas, Ajustes)."""
+    return db.query(models.InventoryMovement).order_by(models.InventoryMovement.id.desc()).all()
+
+
+# ==========================================================
+# 5. INTEGRACIÓN CON SLACK (Webhooks, Alertas y Pruebas)
+# ==========================================================
+@app.get("/api/v1/slack/status", tags=["Slack Integration"])
+def get_slack_status():
+    """Verificar el estado de la integración de Slack para el taller."""
+    webhook = slack_service.get_slack_webhook()
+    return {
+        "configurado": bool(webhook),
+        "webhook_url_preview": (webhook[:30] + "...") if webhook else None,
+        "canal_slack_url": slack_service.SLACK_CHANNEL_URL,
+        "mentor_url": slack_service.SLACK_MENTOR_URL,
+        "modo": "En Vivo (Webhook Activo)" if webhook else "Simulación (Consola Segura)"
+    }
+
+
+@app.post("/api/v1/slack/test", tags=["Slack Integration"])
+def send_slack_test_notification():
+    """Disparar una alerta de prueba al canal de Slack."""
+    res = slack_service.send_slack_message(
+        text="🔔 *¡Prueba de Integración Exitosa!* El sistema *Mecánica Yeyko* está conectado al canal de Slack con Supabase PostgreSQL.",
+        blocks=[
+            {
+                "type": "header",
+                "text": {
+                    "type": "plain_text",
+                    "text": "🛠️ Mecánica Yeyko - Test de Alertas Slack",
+                    "emoji": True
+                }
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "✅ *Conexión verificada exitosamente.*\nLas notificaciones en tiempo real para ventas, compras e inventario crítico están activas."
+                }
+            },
+            {
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": "Proyecto de Grado • Ivan Chiri Lupinta | Santa Cruz Vibeathon"
+                    }
+                ]
+            }
+        ]
+    )
+    return res
+
+
+@app.post("/api/v1/slack/webhook", tags=["Slack Integration"])
+def update_slack_webhook(payload: dict):
+    """Configurar o actualizar la URL del Webhook de Slack."""
+    webhook_url = payload.get("webhook_url", "").strip()
+    os.environ["SLACK_WEBHOOK_URL"] = webhook_url
+
+    # Guardar en archivo .env local
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if os.path.exists(env_path):
+        with open(env_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        
+        updated = False
+        new_lines = []
+        for line in lines:
+            if line.startswith("SLACK_WEBHOOK_URL="):
+                new_lines.append(f"SLACK_WEBHOOK_URL={webhook_url}\n")
+                updated = True
+            else:
+                new_lines.append(line)
+        
+        if not updated and webhook_url:
+            new_lines.append(f"\nSLACK_WEBHOOK_URL={webhook_url}\n")
+            
+        with open(env_path, "w", encoding="utf-8") as f:
+            f.writelines(new_lines)
+
+    return {
+        "status": "success",
+        "message": "Webhook de Slack actualizado correctamente",
+        "configurado": bool(webhook_url)
+    }
+
